@@ -1,4 +1,5 @@
 import {
+  ChangeEvent,
   FormEvent,
   useCallback,
   useEffect,
@@ -10,7 +11,11 @@ import {
   Archive,
   BrainCircuit,
   ChevronRight,
+  Clock3,
+  FileText,
+  Flag,
   History,
+  Link,
   Loader2,
   MessageSquareText,
   PenLine,
@@ -18,11 +23,14 @@ import {
   Send,
   ShieldCheck,
   Sparkles,
+  TimerReset,
+  Upload,
   UserRound,
 } from "lucide-react";
 
 type Role = "interviewer" | "user" | "analyzer" | "strategist";
 type AnswerMode = "idle" | "manual" | "ai";
+type InterviewMode = "easy" | "pressure";
 type SocketStatus =
   | "idle"
   | "connecting"
@@ -30,6 +38,7 @@ type SocketStatus =
   | "thinking"
   | "waiting_user"
   | "waiting_user_choice"
+  | "ended"
   | "error";
 
 type ChatMessage = {
@@ -54,6 +63,17 @@ type SessionSummary = {
   updated_at: string;
   last_message: string | null;
   message_count: number;
+  interview_mode: InterviewMode;
+  ended_at: string | null;
+  end_reason: string | null;
+};
+
+type Report = {
+  technical_fit?: { score?: number; summary?: string; fact_risks?: string[] };
+  communication_structure?: { score?: number; summary?: string; star_observations?: string[] };
+  emotional_stability?: { score?: number; summary?: string; pressure_moments?: string[] };
+  improvement_plan?: { priorities?: string[]; study_directions?: string[]; next_practice?: string[] };
+  overall_result?: string;
 };
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
@@ -67,12 +87,13 @@ function statusCopy(status: SocketStatus) {
     thinking: "面试官思考中",
     waiting_user: "等待回答",
     waiting_user_choice: "选择回答方式",
+    ended: "面试已结束",
     error: "连接异常",
   };
   return labels[status];
 }
 
-function formatTime(value?: string) {
+function formatTime(value?: string | null) {
   if (!value) {
     return "";
   }
@@ -82,6 +103,13 @@ function formatTime(value?: string) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value));
+}
+
+function formatRemaining(seconds: number) {
+  const safe = Math.max(0, seconds);
+  const minutes = Math.floor(safe / 60);
+  const rest = safe % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
 }
 
 function latestByRole(messages: ChatMessage[], role: Role) {
@@ -104,12 +132,22 @@ async function fetchMessages(sessionId: string) {
   return (await response.json()) as ChatMessage[];
 }
 
+async function fetchReport(sessionId: string) {
+  const response = await fetch(`${API_URL}/api/session/${sessionId}/report`);
+  if (!response.ok) {
+    throw new Error("无法生成复盘报告");
+  }
+  const payload = (await response.json()) as { report: Report };
+  return payload.report;
+}
+
 function useInterviewSocket(sessionId: string | null) {
   const socketRef = useRef<WebSocket | null>(null);
   const [status, setStatus] = useState<SocketStatus>("idle");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [analysis, setAnalysis] = useState("");
   const [strategies, setStrategies] = useState<StrategyCard[]>([]);
+  const [deadlineAt, setDeadlineAt] = useState<string | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -132,7 +170,7 @@ function useInterviewSocket(sessionId: string | null) {
     };
     socket.onclose = () => {
       socketRef.current = null;
-      setStatus((current) => (current === "error" ? "error" : "idle"));
+      setStatus((current) => (current === "error" || current === "ended" ? current : "idle"));
     };
     socket.onmessage = (event: MessageEvent<string>) => {
       let payload: Record<string, any>;
@@ -144,6 +182,18 @@ function useInterviewSocket(sessionId: string | null) {
         return;
       }
 
+      if (payload.type === "connected") {
+        setDeadlineAt(payload.deadline_at ?? null);
+        if (payload.status === "completed") {
+          setStatus("ended");
+        }
+        return;
+      }
+      if (payload.type === "interview_ended") {
+        setStatus("ended");
+        setDeadlineAt(null);
+        return;
+      }
       if (payload.type === "agent_status") {
         setStatus(payload.status as SocketStatus);
         return;
@@ -152,6 +202,12 @@ function useInterviewSocket(sessionId: string | null) {
         setError(String(payload.message ?? "服务端返回错误"));
         setStatus("error");
         return;
+      }
+      if (payload.deadline_at) {
+        setDeadlineAt(String(payload.deadline_at));
+      }
+      if (payload.ended) {
+        setStatus("ended");
       }
       if (payload.type === "user_message" || payload.type === "agent_message") {
         const nextMessage = {
@@ -209,23 +265,126 @@ function useInterviewSocket(sessionId: string | null) {
     }
   }, []);
 
-  return { status, messages, analysis, strategies, error, send, start, replaceMessages };
+  const endViaSocket = useCallback(() => {
+    const socket = socketRef.current;
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "end_interview" }));
+    }
+    setStatus("ended");
+    setDeadlineAt(null);
+  }, []);
+
+  return {
+    status,
+    messages,
+    analysis,
+    strategies,
+    deadlineAt,
+    error,
+    send,
+    start,
+    endViaSocket,
+    replaceMessages,
+  };
+}
+
+function ReportPanel({ report }: { report: Report | null }) {
+  if (!report) {
+    return (
+      <p className="rounded-md border border-dashed border-slate-300 p-4 text-sm leading-6 text-slate-500">
+        面试结束后，这里会生成技术契合度、沟通结构性、情绪稳定性和优化建议。
+      </p>
+    );
+  }
+
+  const blocks = [
+    {
+      title: "技术契合度",
+      score: report.technical_fit?.score,
+      summary: report.technical_fit?.summary,
+      items: report.technical_fit?.fact_risks,
+    },
+    {
+      title: "沟通结构性",
+      score: report.communication_structure?.score,
+      summary: report.communication_structure?.summary,
+      items: report.communication_structure?.star_observations,
+    },
+    {
+      title: "情绪稳定性",
+      score: report.emotional_stability?.score,
+      summary: report.emotional_stability?.summary,
+      items: report.emotional_stability?.pressure_moments,
+    },
+    {
+      title: "优化建议",
+      score: undefined,
+      summary: report.improvement_plan?.priorities?.join(" / "),
+      items: [
+        ...(report.improvement_plan?.study_directions ?? []),
+        ...(report.improvement_plan?.next_practice ?? []),
+      ],
+    },
+  ];
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-md bg-slate-950 px-3 py-2 text-sm font-semibold text-cyan-200">
+        综合结论：{report.overall_result ?? "needs_practice"}
+      </div>
+      {blocks.map((block) => (
+        <article key={block.title} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold text-slate-950">{block.title}</h3>
+            {typeof block.score === "number" && (
+              <span className="rounded-full bg-cyan-50 px-2 py-1 text-xs font-semibold text-cyan-800">
+                {block.score}
+              </span>
+            )}
+          </div>
+          <p className="mt-2 text-sm leading-6 text-slate-700">{block.summary || "暂无总结。"}</p>
+          <ul className="mt-2 space-y-1 text-xs leading-5 text-slate-600">
+            {(block.items ?? []).map((item) => (
+              <li key={item}>- {item}</li>
+            ))}
+          </ul>
+        </article>
+      ))}
+    </div>
+  );
 }
 
 export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [jobTitle, setJobTitle] = useState("高级前端工程师");
   const [resume, setResume] = useState("");
+  const [jdText, setJdText] = useState("");
+  const [jdUrl, setJdUrl] = useState("");
+  const [interviewMode, setInterviewMode] = useState<InterviewMode>("easy");
   const [input, setInput] = useState("");
   const [isCreating, setIsCreating] = useState(false);
+  const [isUploadingPdf, setIsUploadingPdf] = useState(false);
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false);
   const [createError, setCreateError] = useState("");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [answerMode, setAnswerMode] = useState<AnswerMode>("idle");
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [report, setReport] = useState<Report | null>(null);
+  const [remainingSeconds, setRemainingSeconds] = useState(0);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const hasStartedRef = useRef(false);
-  const { status, messages, analysis, strategies, error, send, start, replaceMessages } =
-    useInterviewSocket(sessionId);
+  const {
+    status,
+    messages,
+    analysis,
+    strategies,
+    deadlineAt,
+    error,
+    send,
+    start,
+    endViaSocket,
+    replaceMessages,
+  } = useInterviewSocket(sessionId);
 
   const conversationMessages = useMemo(
     () => messages.filter((message) => message.role === "interviewer" || message.role === "user"),
@@ -235,10 +394,11 @@ export default function App() {
     const lastInterviewMessage = [...conversationMessages]
       .reverse()
       .find((message) => message.role === "interviewer" || message.role === "user");
-    return lastInterviewMessage?.role === "interviewer" && status !== "thinking";
+    return lastInterviewMessage?.role === "interviewer" && status !== "thinking" && status !== "ended";
   }, [conversationMessages, status]);
 
   const activeSession = sessions.find((session) => session.session_id === sessionId);
+  const activeMode = activeSession?.interview_mode ?? interviewMode;
   const latestQuestion = latestByRole(messages, "interviewer");
 
   const refreshSessions = useCallback(async () => {
@@ -271,20 +431,74 @@ export default function App() {
   }, [hasQuestionWaiting, latestQuestion]);
 
   useEffect(() => {
-    if (status === "waiting_user" || status === "waiting_user_choice") {
+    if (status === "waiting_user" || status === "waiting_user_choice" || status === "ended") {
       refreshSessions();
     }
   }, [refreshSessions, status]);
+
+  useEffect(() => {
+    if (status === "ended" && sessionId && !report && !isGeneratingReport) {
+      generateCurrentReport();
+    }
+  }, [isGeneratingReport, report, sessionId, status]);
+
+  useEffect(() => {
+    if (!deadlineAt || activeMode !== "pressure" || status === "ended") {
+      setRemainingSeconds(0);
+      return;
+    }
+    const tick = () => {
+      setRemainingSeconds(Math.max(0, Math.floor((new Date(deadlineAt).getTime() - Date.now()) / 1000)));
+    };
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [activeMode, deadlineAt, status]);
+
+  async function uploadPdf(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    setIsUploadingPdf(true);
+    setCreateError("");
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const response = await fetch(`${API_URL}/api/session/resume/upload`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!response.ok) {
+        throw new Error("PDF 解析失败");
+      }
+      const payload = (await response.json()) as { text: string };
+      setResume(payload.text);
+    } catch (caught) {
+      setCreateError(caught instanceof Error ? caught.message : "PDF 解析失败");
+    } finally {
+      setIsUploadingPdf(false);
+      event.target.value = "";
+    }
+  }
 
   async function createSession(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setCreateError("");
     setIsCreating(true);
+    setReport(null);
     try {
       const response = await fetch(`${API_URL}/api/session/create`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ job_title: jobTitle, resume }),
+        body: JSON.stringify({
+          job_title: jobTitle,
+          resume,
+          jd_text: jdText,
+          jd_url: jdUrl,
+          interview_mode: interviewMode,
+          question_time_limit_seconds: 300,
+        }),
       });
       if (!response.ok) {
         throw new Error("创建会话失败");
@@ -305,11 +519,16 @@ export default function App() {
   async function openSession(nextSessionId: string) {
     setIsLoadingHistory(true);
     setAnswerMode("idle");
+    setReport(null);
     hasStartedRef.current = true;
     try {
       const history = await fetchMessages(nextSessionId);
       setSessionId(nextSessionId);
       replaceMessages(history);
+      const nextSession = sessions.find((item) => item.session_id === nextSessionId);
+      if (nextSession?.status === "completed") {
+        setReport(await fetchReport(nextSessionId));
+      }
     } finally {
       setIsLoadingHistory(false);
     }
@@ -331,9 +550,45 @@ export default function App() {
     setAnswerMode("idle");
   }
 
+  async function endInterview() {
+    if (!sessionId) {
+      return;
+    }
+    const confirmed = window.confirm("确定要结束这场面试并生成复盘吗？");
+    if (!confirmed) {
+      return;
+    }
+    setIsGeneratingReport(true);
+    try {
+      await fetch(`${API_URL}/api/session/${sessionId}/end`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "abandoned" }),
+      });
+      endViaSocket();
+      setReport(await fetchReport(sessionId));
+      await refreshSessions();
+    } finally {
+      setIsGeneratingReport(false);
+    }
+  }
+
+  async function generateCurrentReport() {
+    if (!sessionId) {
+      return;
+    }
+    setIsGeneratingReport(true);
+    try {
+      setReport(await fetchReport(sessionId));
+      await refreshSessions();
+    } finally {
+      setIsGeneratingReport(false);
+    }
+  }
+
   return (
     <main className="min-h-screen bg-[#e9edf0] text-slate-950">
-      <div className="grid min-h-screen grid-cols-1 gap-3 p-3 xl:grid-cols-[300px_minmax(520px,1fr)_390px]">
+      <div className="grid min-h-screen grid-cols-1 gap-3 p-3 xl:grid-cols-[330px_minmax(540px,1fr)_410px]">
         <aside className="flex min-h-[220px] flex-col overflow-hidden rounded-lg border border-slate-300 bg-[#111820] text-slate-100 shadow-sm">
           <header className="border-b border-white/10 p-4">
             <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.18em] text-cyan-300">
@@ -341,7 +596,7 @@ export default function App() {
               Interview files
             </div>
             <h1 className="mt-3 text-2xl font-semibold tracking-tight">面试档案</h1>
-            <p className="mt-1 text-sm leading-6 text-slate-400">查看历史问答，继续任意一场模拟。</p>
+            <p className="mt-1 text-sm leading-6 text-slate-400">导入简历和 JD，开始一场更贴近真实岗位的模拟。</p>
           </header>
 
           <form onSubmit={createSession} className="grid gap-3 border-b border-white/10 p-4">
@@ -353,15 +608,72 @@ export default function App() {
                 onChange={(event) => setJobTitle(event.target.value)}
               />
             </label>
+
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setInterviewMode("easy")}
+                className={`rounded-md border px-3 py-2 text-left text-sm ${
+                  interviewMode === "easy" ? "border-cyan-300 bg-cyan-300/15 text-cyan-100" : "border-white/10 bg-white/[0.04] text-slate-300"
+                }`}
+              >
+                <Clock3 size={16} />
+                <div className="mt-1 font-semibold">Easy</div>
+                <div className="text-xs text-slate-500">不限时</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => setInterviewMode("pressure")}
+                className={`rounded-md border px-3 py-2 text-left text-sm ${
+                  interviewMode === "pressure" ? "border-cyan-300 bg-cyan-300/15 text-cyan-100" : "border-white/10 bg-white/[0.04] text-slate-300"
+                }`}
+              >
+                <TimerReset size={16} />
+                <div className="mt-1 font-semibold">压力</div>
+                <div className="text-xs text-slate-500">每题 5 分钟</div>
+              </button>
+            </div>
+
             <label className="grid gap-1.5">
-              <span className="text-xs font-medium text-slate-300">简历摘要</span>
+              <span className="flex items-center gap-2 text-xs font-medium text-slate-300">
+                <FileText size={14} />
+                简历 / 项目经历
+              </span>
               <textarea
-                className="min-h-24 resize-none rounded-md border border-white/10 bg-white/[0.08] p-3 text-sm leading-6 text-white outline-none ring-cyan-300/40 placeholder:text-slate-500 focus:ring-2"
+                className="min-h-28 resize-none rounded-md border border-white/10 bg-white/[0.08] p-3 text-sm leading-6 text-white outline-none ring-cyan-300/40 placeholder:text-slate-500 focus:ring-2"
                 value={resume}
                 onChange={(event) => setResume(event.target.value)}
-                placeholder="项目经历、技术栈、薪资诉求"
+                placeholder="手动输入，或上传 PDF 自动识别"
               />
             </label>
+            <label className="inline-flex h-10 cursor-pointer items-center justify-center gap-2 rounded-md border border-white/10 bg-white/[0.05] px-3 text-sm text-slate-200 hover:bg-white/[0.09]">
+              {isUploadingPdf ? <Loader2 className="animate-spin" size={17} /> : <Upload size={17} />}
+              上传 PDF 简历
+              <input className="hidden" type="file" accept="application/pdf" onChange={uploadPdf} />
+            </label>
+
+            <label className="grid gap-1.5">
+              <span className="flex items-center gap-2 text-xs font-medium text-slate-300">
+                <Link size={14} />
+                JD 链接
+              </span>
+              <input
+                className="h-10 rounded-md border border-white/10 bg-white/[0.08] px-3 text-sm text-white outline-none ring-cyan-300/40 placeholder:text-slate-500 focus:ring-2"
+                value={jdUrl}
+                onChange={(event) => setJdUrl(event.target.value)}
+                placeholder="https://..."
+              />
+            </label>
+            <label className="grid gap-1.5">
+              <span className="text-xs font-medium text-slate-300">JD 文本</span>
+              <textarea
+                className="min-h-24 resize-none rounded-md border border-white/10 bg-white/[0.08] p-3 text-sm leading-6 text-white outline-none ring-cyan-300/40 placeholder:text-slate-500 focus:ring-2"
+                value={jdText}
+                onChange={(event) => setJdText(event.target.value)}
+                placeholder="粘贴岗位职责、任职要求"
+              />
+            </label>
+
             <button
               type="submit"
               disabled={isCreating}
@@ -407,14 +719,19 @@ export default function App() {
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
                       <div className="truncate text-sm font-semibold text-white">{session.job_title}</div>
-                      <div className="mt-1 text-xs text-slate-500">{formatTime(session.updated_at)}</div>
+                      <div className="mt-1 text-xs text-slate-500">
+                        {formatTime(session.updated_at)} · {session.interview_mode}
+                      </div>
                     </div>
                     <ChevronRight size={16} className="mt-0.5 text-slate-500" />
                   </div>
                   <p className="mt-2 max-h-10 overflow-hidden text-xs leading-5 text-slate-400">
                     {session.last_message || "尚未产生问答"}
                   </p>
-                  <div className="mt-2 text-xs text-cyan-200">{session.message_count} 条消息</div>
+                  <div className="mt-2 flex items-center justify-between text-xs">
+                    <span className="text-cyan-200">{session.message_count} 条消息</span>
+                    {session.status === "completed" && <span className="text-amber-200">已结束</span>}
+                  </div>
                 </button>
               ))
             )}
@@ -433,8 +750,25 @@ export default function App() {
                   {activeSession?.job_title || jobTitle || "创建一场模拟"}
                 </h2>
               </div>
-              <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
-                {isLoadingHistory ? "加载历史中" : statusCopy(status)}
+              <div className="flex flex-wrap items-center gap-2">
+                {activeMode === "pressure" && status !== "ended" && (
+                  <div className={`rounded-md px-3 py-2 text-sm font-semibold ${remainingSeconds <= 60 && remainingSeconds > 0 ? "bg-rose-50 text-rose-700" : "bg-slate-950 text-cyan-200"}`}>
+                    {remainingSeconds > 0 ? formatRemaining(remainingSeconds) : "等待计时"}
+                  </div>
+                )}
+                <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600">
+                  {isLoadingHistory ? "加载历史中" : statusCopy(status)}
+                </div>
+                {sessionId && status !== "ended" && (
+                  <button
+                    type="button"
+                    onClick={endInterview}
+                    className="inline-flex h-10 items-center gap-2 rounded-md bg-rose-600 px-3 text-sm font-semibold text-white hover:bg-rose-700"
+                  >
+                    <Flag size={16} />
+                    放弃面试
+                  </button>
+                )}
               </div>
             </div>
 
@@ -465,9 +799,9 @@ export default function App() {
               <div className="flex h-full items-center justify-center">
                 <div className="max-w-md rounded-lg border border-dashed border-slate-300 bg-white p-6 text-center">
                   <BrainCircuit className="mx-auto text-cyan-700" size={34} />
-                  <h3 className="mt-4 text-lg font-semibold">从左侧创建一场压力面试</h3>
+                  <h3 className="mt-4 text-lg font-semibold">从左侧创建一场 JD 驱动面试</h3>
                   <p className="mt-2 text-sm leading-6 text-slate-500">
-                    输入岗位和简历摘要后，系统会生成首问，并在右侧给出潜台词和策略。
+                    上传简历、粘贴 JD，系统会先拆解岗位诉求，再让面试官围绕核心要求追问。
                   </p>
                 </div>
               </div>
@@ -518,7 +852,19 @@ export default function App() {
           </div>
 
           <footer className="border-t border-slate-200 bg-white p-4">
-            {hasQuestionWaiting ? (
+            {status === "ended" ? (
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-3 text-sm text-amber-800">
+                <span>面试已结束，可以查看或重新生成面后复盘。</span>
+                <button
+                  type="button"
+                  onClick={generateCurrentReport}
+                  className="inline-flex h-9 items-center gap-2 rounded-md bg-amber-600 px-3 font-semibold text-white"
+                >
+                  {isGeneratingReport ? <Loader2 className="animate-spin" size={16} /> : <FileText size={16} />}
+                  生成复盘
+                </button>
+              </div>
+            ) : hasQuestionWaiting ? (
               <div className="space-y-3">
                 <div className="flex flex-wrap gap-2">
                   <button
@@ -606,7 +952,7 @@ export default function App() {
               </div>
               <span className="rounded-full bg-rose-50 px-2 py-1 text-xs text-rose-700">Agent A</span>
             </header>
-            <div className="h-[290px] overflow-y-auto whitespace-pre-wrap p-4 text-sm leading-6 text-slate-700">
+            <div className="h-[230px] overflow-y-auto whitespace-pre-wrap p-4 text-sm leading-6 text-slate-700">
               {analysis || "面试官发问后，这里会拆解真实意图、潜在陷阱和应对原则。"}
             </div>
           </section>
@@ -619,7 +965,7 @@ export default function App() {
               </div>
               <span className="rounded-full bg-cyan-50 px-2 py-1 text-xs text-cyan-800">Agent B</span>
             </header>
-            <div className="grid max-h-[520px] gap-3 overflow-y-auto p-4">
+            <div className="grid max-h-[320px] gap-3 overflow-y-auto p-4">
               {strategies.length === 0 ? (
                 <p className="rounded-md border border-dashed border-slate-300 p-4 text-sm leading-6 text-slate-500">
                   等待策略生成。选择 AI 替答后，可点击卡片直接作为候选人回答。
@@ -633,6 +979,19 @@ export default function App() {
                   </article>
                 ))
               )}
+            </div>
+          </section>
+
+          <section className="overflow-hidden rounded-lg border border-slate-300 bg-white shadow-sm">
+            <header className="flex h-14 items-center justify-between border-b border-slate-200 px-4">
+              <div className="flex items-center gap-2">
+                <FileText className="text-amber-600" size={18} />
+                <h2 className="text-sm font-semibold text-slate-950">面后复盘</h2>
+              </div>
+              <span className="rounded-full bg-amber-50 px-2 py-1 text-xs text-amber-700">Report</span>
+            </header>
+            <div className="max-h-[430px] overflow-y-auto p-4">
+              <ReportPanel report={report} />
             </div>
           </section>
 

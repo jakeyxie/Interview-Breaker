@@ -17,6 +17,8 @@
 - SQLite + SQLAlchemy asyncio + aiosqlite
 - LangGraph + LangChain
 - OpenAI-compatible Chat API，可切换到本地 vLLM
+- PDF 简历文本提取
+- JD 文本/链接导入和结构化拆解
 
 前端：
 
@@ -189,8 +191,31 @@ Content-Type: application/json
 
 {
   "job_title": "高级前端工程师",
-  "resume": "5 年前端经验，熟悉 React、TypeScript、性能优化..."
+  "resume": "5 年前端经验，熟悉 React、TypeScript、性能优化...",
+  "jd_text": "岗位职责和任职要求...",
+  "jd_url": "https://example.com/job",
+  "interview_mode": "pressure",
+  "question_time_limit_seconds": 300
 }
+```
+
+上传 PDF 简历：
+
+```http
+POST /api/session/resume/upload
+Content-Type: multipart/form-data
+```
+
+结束面试：
+
+```http
+POST /api/session/{session_id}/end
+```
+
+获取面后复盘：
+
+```http
+GET /api/session/{session_id}/report
 ```
 
 WebSocket 对话：
@@ -228,6 +253,7 @@ backend/interview_breaker.db
 
 - `sessions`：记录一次面试模拟，包含 `session_id`、`job_title`、`resume`、`status`、时间戳。
 - `messages`：记录对话流，包含 `id`、`session_id`、`role`、`content`、`timestamp`。
+- 会话额外保存 JD、面试模式、倒计时截止时间、结束原因和复盘报告。
 
 ## 常见问题
 

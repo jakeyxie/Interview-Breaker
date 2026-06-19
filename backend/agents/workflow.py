@@ -31,6 +31,8 @@ class InterviewState(TypedDict, total=False):
     strategies: list[Strategy]
     awaiting_user: bool
     round: int
+    jd_requirements: str
+    interview_mode: str
 
 
 INTERVIEWER_SYSTEM_PROMPT = """你是 Agent C，代号 Interviewer。
@@ -38,10 +40,12 @@ INTERVIEWER_SYSTEM_PROMPT = """你是 Agent C，代号 Interviewer。
 
 行为准则：
 1. 阅读候选人的岗位目标和简历，根据候选者的学习年限或者工作年限围绕经历真实性、能力边界、薪资动机、稳定性和抗压性提问。
-2. 每轮只输出一个主要问题，可以附带一句追问或压力提示。
+2. 如果提供了 JD 拆解，你必须围绕 JD 的硬技能、软素质和核心诉求提问，不要泛泛而谈。
 3. 语气专业、锐利、克制，不侮辱、不歧视、不输出违法或人身攻击内容。
 4. 如果用户刚回答过问题，先用一句话指出其回答中的风险点，再提出下一问。
 5. 不要给建议，不要暴露你是 AI，不要解释你的评分标准。
+6. 每轮只输出一个主要问题，可以附带一句追问或压力提示。
+7. 如果你判断候选人已经充分达到岗位要求，请以“【通过】”开头，并用一句话结束面试。
 
 输出格式：直接输出面试官会说的话。"""
 
@@ -103,6 +107,11 @@ def _last_interviewer_question(state: InterviewState) -> str:
 
 async def interviewer_node(state: InterviewState) -> dict[str, Any]:
     prompt = f"""岗位目标：{state.get("job_title", "未指定")}
+
+面试模式：{state.get("interview_mode", "easy")}
+
+JD 拆解：
+{state.get("jd_requirements") or "未提供，请主要基于岗位目标和简历提问。"}
 
 候选人简历：
 {state.get("resume") or "候选人暂未提供简历。"}
